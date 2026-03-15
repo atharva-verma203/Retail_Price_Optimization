@@ -1,0 +1,303 @@
+---
+title: "Retail Price Optimization using Neural Network"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+
+# Step 1 : Initial Data Setup
+# Import all libraries required
+library(readxl)
+library(caret)
+library(tidyverse)
+
+# Enter file path as required
+Retail_Price_Optimization_Dataset <- read_excel("C:/Users/Atharva/OneDrive/Desktop/My_Work/MSc-II-Work/Microsoft Excel/Retail Price Optimization Dataset.xlsx")
+# Dataset can be found here :
+# https://www.kaggle.com/datasets/suddharshan/retail-price-optimization/data
+df = Retail_Price_Optimization_Dataset
+# View(df)
+
+```
+
+```{r}
+
+# Step 2 : Data preprocessing, check for missing values
+library(skimr)
+skim(df)
+
+# Step 2A : Remove unnecessary columns and rename columns wherever required
+df_clean = df[, !names(df) %in% c("product_id", "month_year", "product_name_lenght",
+                                  "product_description_lenght", "product_photos_qty", "s")]
+df_clean = df_clean %>%
+  rename(
+    # Target and Core Price
+    monthly_sales_qty = qty, monthly_revenue = total_price,
+    company_unit_price = unit_price, previous_month_price = lag_price,
+    
+    # Company Logistics/Features
+    company_freight_price = freight_price, product_weight_grams = product_weight_g,
+    
+    # Competitor 1
+    comp1_price = comp_1, comp1_score = ps1, comp1_freight_price = fp1,
+    
+    # Competitor 2
+    comp2_price = comp_2, comp2_score = ps2, comp2_freight_price = fp2,
+    
+    # Competitor 3
+    comp3_price = comp_3, comp3_score = ps3, comp3_freight_price = fp3
+  )
+
+# Step 2B : One-Hot Encoding of product_category_name
+# This step is done separately for clarity, and because inputs in NN must be numeric
+ohe_product_categories = dummyVars(~ product_category_name, data = df_clean)
+ohe_data_matrix = predict(ohe_product_categories, newdata = df_clean)
+df_ohe = as_tibble(ohe_data_matrix)
+df_ohe = df_ohe %>%
+  rename_with(~ str_replace(., "product_category_name", ""))
+
+df_clean = df_clean %>%
+  select(-product_category_name) %>%
+  bind_cols(df_ohe)
+
+# Cleaned dataset for analysis
+skim(df_clean)
+
+```
+
+```{r}
+
+# Step 3 : Implementation of Neural Network (NN) (Regression Problem)
+library(keras)
+library(tensorflow)
+library(ggplot2)
+
+# Step 3A : Regression Modeling
+
+# Set seed for reproducibility with TensorFlow (through Keras)
+library(reticulate)
+if(requireNamespace("reticulate", quietly = TRUE)){
+  reticulate::py_set_seed(123)
+}
+tf$random$set_seed(123)
+
+# Inputs as well as output are normalized for a NN to work efficiently
+target_col = "monthly_revenue"
+input_cols = names(df_clean)[!names(df_clean) %in% target_col]
+
+# Regression Model Fit to check statistically significant features
+predictor_string = paste(input_cols, collapse = " + ")
+formula_string = paste(target_col, "~", predictor_string)
+reg_formula = as.formula(formula_string)
+reg_model = lm(reg_formula, data = df_clean);reg_model
+model_summary = summary(reg_model);model_summary
+
+# Check if any columns have negative values
+# Useful when choosing activation functions
+negative_check = sapply(df_clean[, input_cols], function(x) any(x < 0))
+negative_cols = names(negative_check[negative_check == TRUE]);negative_cols
+
+```
+
+```{r}
+
+# Step 3B : Hyperparameter Setup
+# Normalization of input columns using Min-Max scaling in [0, 1]
+preproc_params = preProcess(df_clean[, c(target_col, input_cols)], method = c("range"))
+df_normalized = predict(preproc_params, df_clean)
+
+# Data Splitting
+set.seed(123)
+index = createDataPartition(df_normalized[[target_col]], p = 0.8, list = FALSE)
+train_data <- df_normalized[index, ]
+test_data <- df_normalized[-index, ]
+
+X_train = as.matrix(train_data[, input_cols])
+Y_train = as.matrix(train_data[[target_col]])
+X_test = as.matrix(test_data[, input_cols])
+Y_test = test_data[[target_col]]
+
+# Input shape for Keras models
+input_shape = ncol(X_train)
+epochs_run = 50 # number of iterations
+
+```
+
+```{r}
+
+# Step 3C : Function Definition for Model Performance
+evaluate_regression_model = function(model, X_test, Y_test_scaled, preproc_params, target_col){
+  predictions_scaled = predict(model, X_test)
+  predictions_vector = as.vector(predictions_scaled)
+  
+  # Metrics for regression model performance
+  
+  # Coefficient of Determination (R^2)
+  SST = sum((Y_test_scaled - mean(Y_test_scaled))^2)
+  SSE = sum((Y_test_scaled - predictions_vector)^2)
+  R_squared = 1 - (SSE/SST)
+  
+  # Root Mean Square Error (RMSE)
+  RMSE = sqrt(mean((Y_test_scaled - predictions_vector)^2))
+  
+  # Mean Absolute Error (MAE)
+  MAE = mean(abs(Y_test_scaled - predictions_vector))
+  
+  # Mean Absolute Percentage Error (MAPE)
+  actual_df_input = as_tibble(X_test)
+  actual_df_input[[target_col]] = Y_test_scaled
+  predictions_df_input = as_tibble(X_test)
+  predictions_df_input[[target_col]] = predictions_vector
+  Y_test_original_full = predict(preproc_params, actual_df_input)
+  predictions_original_full = predict(preproc_params, predictions_df_input)
+  Y_test_original = Y_test_original_full[[target_col]]
+  predictions_original = predictions_original_full[[target_col]]
+  
+  # To avoid zero division error
+  epsilon = 1e-8 # tolerance
+  MAPE = mean(abs((Y_test_original - predictions_original)/(Y_test_original + epsilon)))*100
+  
+  return(list(R_squared = R_squared, RMSE = RMSE, MAE = MAE, MAPE = MAPE))
+}
+
+```
+
+```{r}
+
+# Step 4 : Model Training and Evaluation
+
+# Model 1 : With Sigmoid Activation Function
+nn_model_sigmoid = keras_model_sequential() %>%
+  # Input Layer : 31 neurons (22 features + 9 one-hot encoded features)
+  layer_dense(units = 31, activation = "sigmoid", input_shape = input_shape) %>%
+  # Hidden Layer 1 : 32 neurons
+  layer_dense(units = 32, activation = "sigmoid") %>%
+  # Hidden Layer 2 : 16 neurons
+  layer_dense(units = 16, activation = "sigmoid") %>%
+  # Output Layer : 1 neuron
+  layer_dense(units = 1, activation = "linear")
+nn_model_sigmoid %>% compile(optimizer = "adam", loss = "mse", metrics = c("mae"))
+
+history_sigmoid = nn_model_sigmoid %>%
+  fit(X_train, Y_train, epochs = epochs_run, batch_size = 32, validation_split = 0.2, verbose = 0)
+
+metrics_sigmoid = evaluate_regression_model(nn_model_sigmoid, X_test, Y_test, preproc_params, target_col)
+
+# Model 2 : With Rectified Linear Unit (ReLU) Activation Function
+nn_model_relu = keras_model_sequential() %>%
+  # Input Layer : 31 neurons (22 features + 9 one-hot encoded features)
+  layer_dense(units = 31, activation = "relu", input_shape = input_shape) %>%
+  # Hidden Layer 1 : 32 neurons
+  layer_dense(units = 32, activation = "relu") %>%
+  # Hidden Layer 2 : 16 neurons
+  layer_dense(units = 16, activation = "relu") %>%
+  # Output Layer : 1 neuron
+  layer_dense(units = 1, activation = "linear")
+nn_model_relu %>% compile(optimizer = "adam", loss = "mse", metrics = c("mae"))
+
+history_relu = nn_model_relu %>%
+  fit(X_train, Y_train, epochs = epochs_run, batch_size = 32, validation_split = 0.2, verbose = 0)
+
+metrics_relu = evaluate_regression_model(nn_model_relu, X_test, Y_test, preproc_params, target_col)
+
+# Model 3 : With Leaky ReLU Activation Function
+nn_model_leakyrelu = keras_model_sequential() %>%
+  # Input Layer : 31 neurons (22 features + 9 one-hot encoded features)
+  layer_dense(units = 31, input_shape = input_shape) %>%
+  layer_activation_leaky_relu(alpha = 0.01) %>%
+  # Hidden Layer 1 : 32 neurons
+  layer_dense(units = 32) %>%
+  layer_activation_leaky_relu(alpha = 0.01) %>%
+  # Hidden Layer 2 : 16 neurons
+  layer_dense(units = 16) %>%
+  layer_activation_leaky_relu(alpha = 0.01) %>%
+  # Output Layer : 1 neuron
+  layer_dense(units = 1, activation = "linear")
+nn_model_leakyrelu %>% compile(optimizer = "adam", loss = "mse", metrics = c("mae"))
+
+history_leakyrelu = nn_model_leakyrelu %>%
+  fit(X_train, Y_train, epochs = epochs_run, batch_size = 32, validation_split = 0.2, verbose = 0)
+
+metrics_leakyrelu = evaluate_regression_model(nn_model_leakyrelu, X_test, Y_test, preproc_params, target_col)
+
+```
+
+```{r}
+
+# Step 5 : Model Comparison and Visualization
+
+# Step 5A : Visualization of Training History
+# Plot of training loss vs validation loss
+
+# Number of epochs recorded (same for all three models, so we can choose any one here)
+num_epochs = length(history_relu$metrics$loss);num_epochs
+
+history_sigmoid_df = as.data.frame(history_sigmoid$metrics) %>%
+  mutate(Model = "Sigmoid", Epoch = 1:num_epochs)
+history_relu_df = as.data.frame(history_relu$metrics) %>%
+  mutate(Model = "ReLU", Epoch = 1:num_epochs)
+history_leakyrelu_df = as.data.frame(history_leakyrelu$metrics) %>%
+  mutate(Model = "Leaky ReLU", Epoch = 1:num_epochs)
+all_history = bind_rows(history_sigmoid_df, history_relu_df, history_leakyrelu_df)
+
+plot_history = all_history %>%
+  select(Model, Epoch, loss, val_loss) %>%
+  pivot_longer(cols = c("loss", "val_loss"),
+               names_to = "Metric_Type", values_to = "Loss_Value") %>%
+  mutate(Metric_Type = case_match(Metric_Type,
+                                  "loss" ~ "Training Loss (MSE)",
+                                  "val_loss" ~ "Validation Loss (MSE)"))
+ggplot(plot_history, aes(x = Epoch, y = Loss_Value, color = Model)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ Metric_Type, scales = "free_y") +
+  labs(title = "Neural Network Loss Curves by Activation Function",
+       y = "Mean Squared Error (MSE)", x = "Epoch") +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+```{r}
+
+# Step 5B : Model Comparison
+model_comparison = tibble(
+  Function = c("Sigmoid", "ReLU", "Leaky ReLU"),
+  R2 = c(metrics_sigmoid$R_squared, metrics_relu$R_squared, metrics_leakyrelu$R_squared),
+  RMSE = c(metrics_sigmoid$RMSE, metrics_relu$RMSE, metrics_leakyrelu$RMSE),
+  MAE = c(metrics_sigmoid$MAE, metrics_relu$MAE, metrics_leakyrelu$MAE),
+  MAPE = c(metrics_sigmoid$MAPE, metrics_relu$MAPE, metrics_leakyrelu$MAPE)
+)
+print(model_comparison %>% mutate(across(where(is.numeric), ~ round(., 4))), n = 3, width = Inf)
+
+```
+
+```{r}
+
+# Step 5C : Visualization
+plot_data = model_comparison %>%
+  select(Function, R2, RMSE, MAE, MAPE) %>%
+  pivot_longer(cols = starts_with("R") | starts_with("M"),
+               names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric = case_match(Metric, "R2" ~ "R-squared (R2)", "RMSE" ~ "RMSE (scaled)", "MAE" ~ "MAE (scaled)", "MAPE" ~ "MAPE (%)"))
+ggplot(plot_data, aes(x = Function, y = Value, fill = Function)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(title = "Neural Network Performance by Activation Function",
+       y = "Metric Value", x = "Activation Function") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.

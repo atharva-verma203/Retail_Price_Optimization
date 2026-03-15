@@ -1,0 +1,320 @@
+---
+title: "Bayesian Price Optimization: Estimating Price Elasticities & Choosing Profit-Maximizing
+  Prices under Uncertainty"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+1. Setup and Libraries
+We utilize a Bayesian framework to estimate demand elasticity. The primary engine is brms (interface to Stan), supported by tidyverse tools for data manipulation and visualization.
+
+```{r}
+
+library(readxl)
+library(brms)
+library(dplyr)
+library(readr)
+library(posterior)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(cmdstanr)
+
+# We may need a local temp directory for our Stan program to run successfully
+# There may be other workarounds that would work better without causing errors
+custom_temp <- "C:/Users/Atharva/R_Temp"
+if(!dir.exists(custom_temp)) dir.create(custom_temp, recursive = TRUE)
+
+# 1. Standard R temp redirect
+Sys.setenv(TMPDIR = custom_temp, TMP = custom_temp, TEMP = custom_temp)
+
+# 2. THE FIX: Force Stan to use the ROOT of R_Temp instead of a subfolder
+options(substitute_cmd = custom_temp)
+
+# 3. Clean up the 'Truth Check'
+message("Current Temp Dir: ", tempdir())
+
+set_cmdstan_path("C:/Users/Atharva/.cmdstan/cmdstan-2.38.0")
+
+# Enter file path as required
+data <- read_excel("C:/Users/Atharva/OneDrive/Desktop/My_Work/MSc-II-Work/Microsoft Excel/Retail Price Optimization Dataset.xlsx")
+dim(data)
+
+```
+
+2. Data Preprocessing
+We transform the raw retail data into a log-log format to estimate constant elasticity. We also calculate a mean competitor price to account for cross-price effects and handle missing values to ensure model stability.
+
+Note : Whenever competitor prices are missing or non-positive, the product’s own price is used as a fallback.
+
+```{r}
+
+library(dplyr)
+
+print(class(data))
+print(names(data))
+
+print(data)
+
+# Step 2: Assign df to a safe name (not needed)
+#my_df <- as.data.frame(df)  # Ensure it's a data frame
+
+d_filtered <- data %>%filter(!is.na(qty), !is.na(unit_price))
+
+comp_cols <- c("comp_1", "comp_2", "comp_3")
+available_comp_cols <- intersect(comp_cols, names(data))
+print(paste("Available competitor columns:", paste(available_comp_cols, collapse = ", ")))
+
+# Build data step by step
+d <- data %>%
+  mutate(
+    qty_adj = ifelse(qty <= 0, qty + 1, qty),
+    ln_qty = log(qty_adj),
+    ln_price = log(unit_price)
+  )
+
+# Competitor price calculation
+if (length(available_comp_cols) > 0) {
+  d <- d %>%
+    mutate(
+      comp_mean = rowMeans(select(., all_of(available_comp_cols)), na.rm = TRUE),
+      comp_mean = ifelse(is.na(comp_mean) | comp_mean <= 0, unit_price, comp_mean),
+      ln_comp_mean = log(comp_mean)
+    )
+} else {
+  d <- d %>% mutate(comp_mean = unit_price, ln_comp_mean = ln_price)
+}
+
+# Add product and month factors
+d <- d %>% mutate(product_id = factor(product_id), month_ind = factor(month_year))
+
+```
+
+3. Global Bayesian Demand Model
+We implement a Bayesian Hierarchical Linear Model. By using a log-log specification, the coefficients directly represent price elasticities.
+
+Model Highlights :
+a. Formula: $$ln\_qty \sim ln\_price + ln\_comp\_mean + (1|product\_id) + (1|month\_ind)$$
+
+The log-log functional form in the model involves regression of natural logarithm of quantity on natural logarithm of own price and competitor price, with random intercepts for both product ID and month ID to account for unobserved heterogeneity across products (SKUs) and temporal effects.
+
+b. Priors: We use weakly informative, industry-standard priors (e.g. Normal(-1.5, 1) for own-price elasticity) to reflect typical price-sensitive demand while preventing overfitting.
+
+c. Estimation: Hamiltonian Monte Carlo (HMC) sampling via Stan.
+adapt_delta parameter is set to 0.9 to ensure adequate sampling of posterior geometry. This specification provides robust estimation of price sensitivities while properly accounting for the nested structure of the data, yielding posterior distributions that quantify uncertainty in elasticity estimates essential for optimal pricing decisions under uncertainty.
+
+α captures baseline demand, β measures own-price elasticity, γ measures cross-price elasticity reflecting competitor price effects, and σ represents unexplained demand variability.
+
+Here we choose our S greater than the rows involved here to help the Monte Carlo simulations simulate the data more accurately. 
+
+```{r}
+
+# ==========================
+# GLOBAL BAYESIAN DEMAND MODEL
+# ==========================
+suppressPackageStartupMessages({
+  library(brms)
+  library(dplyr)
+  library(cmdstanr)
+})
+
+
+library(brms)
+
+# Model: ln_qty ~ ln_price + ln_comp_mean + (1|product_id) + (1|month_ind)
+# Note : (1|x) denotes a random intercept term 
+form <- bf(ln_qty ~ ln_price + ln_comp_mean + (1 | product_id) + (1 | month_ind))
+
+# Weakly-informative, industry-style priors
+priors <- c(
+  prior(normal(0, 10), class = "Intercept"),
+  prior(normal(-1.5, 1), class = "b", coef = "ln_price"),      # global own-price elasticity
+  prior(normal(0, 1), class = "b", coef = "ln_comp_mean"),     # global competitor elasticity
+  prior(normal(0, 1), class = "sd"),                           # random effects sd
+  prior(exponential(1), class = "sigma")                       # noise sd
+)
+
+options(substitute_cmd = "C:/Users/Atharva/R_Temp")
+
+# Fit the model
+suppressMessages({
+  fit <- brm(
+    formula = form, data = d, prior = priors, chains = 4, iter = 2500,
+    warmup = 1000, cores = 4, control = list(adapt_delta = 0.95), seed = 123,
+    backend = "cmdstanr", refresh = 0, silent = 2
+  )
+})
+
+summary(fit)
+
+# Save right after fitting to avoid compiling again
+saveRDS(fit, "bayesian_retail_fit.rds")
+
+```
+
+4. Posterior Profit Optimization
+This framework translates demand uncertainty into pricing decisions. We simulate the expected profit across a grid of potential prices for each SKU. By integrating over the posterior distribution, we identify the price that maximizes expected profit while accounting for estimation risk.
+
+The core innovation lies in the profit calculation that incorporates both demand uncertainty and cost structure, where unit costs are assumed proportional to current pricing. The optimization employs Monte Carlo integration over the posterior distribution to compute expected profits, identifying the profit-maximizing price for each product. Crucially, the method quantifies uncertainty around optimal pricing decisions by computing the distribution of optimal prices across posterior draws, providing credible intervals that reflect estimation uncertainty.
+
+The implementation scales efficiently across all products using functional programming patterns, handling edge cases where insufficient data exists for reliable estimation. The output provides a complete decision support matrix containing current pricing, recommended optimal prices with uncertainty quantification, and expected profit impacts, enabling data-driven pricing strategy with proper accounting for statistical uncertainty across the entire product catalog.
+
+```{r}
+library(posterior)
+library(purrr)
+library(tibble)
+library(ggplot2)
+
+posterior_draws <- as_draws_df(fit)
+sigma_draws <- posterior_draws$sigma
+S_total <- length(sigma_draws)
+
+# Helper: optimal price for ONE product_id
+optimize_for_sku <- function(sku_id, n_price_points = 60, n_draws = 2000) {
+  d_sku <- d %>% filter(product_id == sku_id)
+
+  if (nrow(d_sku) < 3) {
+    return(tibble(
+      product_id        = sku_id,
+      n_obs             = nrow(d_sku),
+      current_price_med = median(d_sku$unit_price),
+      best_price        = NA_real_,
+      best_profit       = NA_real_,
+      opt_price_median  = NA_real_,
+      opt_price_low95   = NA_real_,
+      opt_price_high95  = NA_real_
+    ))
+  }
+
+  # Assume unit cost = 60% of median price for this SKU
+  cost_i <- 0.6 * median(d_sku$unit_price)
+
+  # Price grid for this SKU
+  p_min <- 0.4 * min(d_sku$unit_price)
+  p_max <- 3.0 * max(d_sku$unit_price)
+  price_grid <- seq(p_min, p_max, length.out = n_price_points)
+
+  # Reference competitor level for this SKU
+  ln_comp_ref <- mean(d_sku$ln_comp_mean, na.rm = TRUE)
+
+  # Newdata for prediction (we ignore random effects with re_formula = NA)
+  newdata <- tibble(
+    ln_price     = log(price_grid),
+    ln_comp_mean = ln_comp_ref,
+    product_id   = d$product_id[1],   # dummy, ignored when re_formula = NA
+    month_ind    = d$month_ind[1]     # dummy
+  )
+
+  # Posterior linear predictor (log-qty), fixed effects only
+  mu_draws <- posterior_linpred(
+    fit,
+    newdata    = newdata,
+    re_formula = NA,
+    transform  = FALSE,
+    ndraws     = n_draws
+  ) # matrix: draws x price_grid
+
+  S <- nrow(mu_draws)
+  # Match sigma length
+  if (S > S_total) {
+    sig <- sample(sigma_draws, size = S, replace = TRUE)
+  } else {
+    sig <- sigma_draws[1:S]
+  }
+
+  # Expected qty per draw, per price (log-normal trick)
+  qty_exp <- exp(mu_draws + 0.5 * (sig^2))
+
+  # Profit per draw & price: (p - cost) * qty
+  profit_draws <- sweep(qty_exp, 2, price_grid - cost_i)
+
+  # Posterior expected profit at each price
+  exp_profit <- colMeans(profit_draws)
+
+  # Best price by expected profit
+  best_idx   <- which.max(exp_profit)
+  best_price <- price_grid[best_idx]
+  best_profit <- exp_profit[best_idx]
+
+  # Draw-wise optimal price (for uncertainty in optimum)
+  opt_idx_per_draw   <- apply(profit_draws, 1, which.max)
+  opt_price_per_draw <- price_grid[opt_idx_per_draw]
+
+  opt_price_median <- median(opt_price_per_draw)
+  opt_price_ci     <- quantile(opt_price_per_draw, probs = c(0.025, 0.975))
+
+  tibble(
+    product_id        = sku_id,
+    n_obs             = nrow(d_sku),
+    current_price_med = median(d_sku$unit_price),
+    best_price        = best_price,
+    best_profit       = best_profit,
+    opt_price_median  = opt_price_median,
+    opt_price_low95   = opt_price_ci[1],
+    opt_price_high95  = opt_price_ci[2]
+  )
+}
+
+# Run global pricing for ALL products
+all_skus <- levels(d$product_id)
+
+sku_results <- map_dfr(all_skus, optimize_for_sku)
+
+print(sku_results)
+```
+
+5. Visualizing the Profit Surface
+Finally, we visualize the "Profit vs. Price" curve for specific SKUs. The red dashed line indicates the price point where the posterior expected profit is maximized.
+
+```{r}
+example_sku <- sku_results$product_id[2] 
+
+plot_sku <- function(sku_id) {
+  d_sku <- d %>% filter(product_id == sku_id)
+  cost_i <- 0.6 * median(d_sku$unit_price)
+
+  p_min <- 0.5 * min(d_sku$unit_price)
+  p_max <- 2.5 * max(d_sku$unit_price)
+  price_grid <- seq(p_min, p_max, length.out = 80)
+  ln_comp_ref <- mean(d_sku$ln_comp_mean, na.rm = TRUE)
+
+  newdata <- tibble(
+    ln_price     = log(price_grid),
+    ln_comp_mean = ln_comp_ref,
+    product_id   = d$product_id[1],
+    month_ind    = d$month_ind[1]
+  )
+
+  mu_draws <- posterior_linpred(
+    fit,
+    newdata    = newdata,
+    re_formula = NA,
+    transform  = FALSE,
+    ndraws     = 2000
+  )
+  S <- nrow(mu_draws)
+  sig <- sigma_draws[1:S]
+
+  qty_exp <- exp(mu_draws + 0.5 * (sig^2))
+  profit_draws <- sweep(qty_exp, 2, price_grid - cost_i, `*`)
+  exp_profit <- colMeans(profit_draws)
+
+  best_idx   <- which.max(exp_profit)
+  best_price <- price_grid[best_idx]
+
+  df_plot <- tibble(price = price_grid, exp_profit = exp_profit)
+
+  ggplot(df_plot, aes(x = price, y = exp_profit)) +
+    geom_line(linewidth = 1, color = "steelblue") +
+    geom_vline(xintercept = best_price, color = "red", linetype = "dashed") +
+    labs(
+      title = paste("Posterior Expected Profit vs Price for", sku_id),
+      x = "Price",
+      y = "Expected Profit"
+    )
+}
+
+plot_sku(example_sku)
+
+```
