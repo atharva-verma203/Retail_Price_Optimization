@@ -32,7 +32,7 @@ This project explores retail price optimization through two distinct computation
 ## 📈 Guide to Interpretation
 Since this project serves as a technical framework, focus on these metrics when reviewing the output:
 
-1.  **Price Elasticity ($\beta$ for $ln_price$)**:
+1.  **Price Elasticity ($\beta$ for ln_price)**:
 * If $\beta < -1$: Demand is Elastic (Price sensitive; small price hikes significantly hurt volume).
 * If $-1 < \beta < 0$: Demand is Inelastic (Price insensitive; price hikes likely increase total revenue).
 * If $\beta \geq 0$ (Anomalous): Indicates potential "Veblen" behavior or presence of confounding variables (e.g., seasonal spikes correlating with price hikes).
